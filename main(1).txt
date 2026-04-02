@@ -1,0 +1,181 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"log/slog"
+	"math/rand"
+	"net/http"
+	"os"
+	"strings"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/joho/godotenv"
+	_ "github.com/mattn/go-sqlite3"
+
+	"context"
+	"time"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
+)
+
+var mySigningKey = []byte("AllYourBase")
+
+func main() {
+	if err := godotenv.Load(); err != nil {
+		log.Println("no .env file found")
+	}
+
+	client, err := mongo.Connect(options.Client().ApplyURI("mongodb://localhost:27017"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := client.Disconnect(ctx); err != nil {
+			slog.Error(err.Error())
+			os.Exit(1)
+		}
+	}()
+
+	if err := client.Ping(context.TODO(), readpref.Primary()); err != nil {
+		slog.Error(err.Error())
+		os.Exit(1)
+	}
+
+	mux := http.NewServeMux()
+
+	shortenHandler := newShortenHandler(client)
+	redirectHandler := newRedirectHandler(client)
+	mux.HandleFunc("/login", loginHandler)
+
+	mux.Handle("/shorten", http.HandlerFunc(authMiddleware(shortenHandler.ServeHTTP)))
+
+	mux.Handle("/{shortUrl}", http.HandlerFunc(authMiddleware(redirectHandler.ServeHTTP)))
+
+	srv := &http.Server{
+		Handler: mux,
+		Addr:    ":" + os.Getenv("PORT"),
+	}
+
+	log.Printf("api serving on %s...\n", os.Getenv("PORT"))
+	srv.ListenAndServe()
+}
+
+type URLBody struct {
+	URL string `json:"url" binding:"required"`
+}
+
+const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+type shortenHandler struct {
+	client *mongo.Client
+}
+
+func newShortenHandler(client *mongo.Client) *shortenHandler {
+	return &shortenHandler{client: client}
+}
+
+func (handler *shortenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	const size = 6
+	var shortenKey [size]byte
+	for i := range size {
+		shortenKey[i] = charset[rand.Intn(len(charset))]
+	}
+
+	var payload URLBody
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	collection := handler.client.Database("urls").Collection("shorten")
+	_, err := collection.InsertOne(context.TODO(), bson.D{{Key: "key", Value: string(shortenKey[:])}, {Key: "original_url", Value: payload.URL}})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"short_url": fmt.Sprintf("http://localhost:%s/%s", os.Getenv("PORT"), string(shortenKey[:])),
+	})
+}
+
+func loginHandler(w http.ResponseWriter, r *http.Request) {
+	// Create the claims
+	claims := jwt.RegisteredClaims{
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(5 * time.Minute)),
+		Issuer:    "test",
+	}
+
+	// Create the token
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+
+	// Sign the token
+	ss, err := token.SignedString(mySigningKey)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]string{
+		"token": ss,
+	})
+}
+
+func authMiddleware(handler http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// request
+		bearerToken := r.Header.Get("Authorization")
+		tokenString := strings.TrimPrefix(bearerToken, "Bearer ")
+
+		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+			return mySigningKey, nil
+		}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
+
+		if err != nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		if !token.Valid {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		handler(w, r)
+	}
+}
+
+type redirectHandler struct {
+	client *mongo.Client
+}
+
+func newRedirectHandler(client *mongo.Client) *redirectHandler {
+	return &redirectHandler{client: client}
+}
+
+func (handler *redirectHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+
+	collection := handler.client.Database("urls").Collection("shorten")
+	key := r.PathValue("shortUrl")
+
+	var result struct {
+		OriginalURL string `bson:"original_url"`
+	}
+	filter := bson.D{{Key: "key", Value: key}}
+	err := collection.FindOne(context.TODO(), filter).Decode(&result)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	http.Redirect(w, r, result.OriginalURL, http.StatusFound)
+
+}
