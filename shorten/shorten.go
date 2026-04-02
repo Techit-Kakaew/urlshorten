@@ -34,11 +34,7 @@ func (handler *shortenHandler) Handler(c httprouter.Context) {
 		c.Status(http.StatusBadRequest)
 	}
 
-	const size = 6
-	var shortenKey [size]byte
-	for i := range size {
-		shortenKey[i] = charset[rand.Intn(len(charset))]
-	}
+	shortenKey := ShortenKey()
 
 	if err := handler.storage.Save(string(shortenKey[:]), payload.URL); err != nil {
 		c.JSON(http.StatusInternalServerError, map[string]string{
@@ -50,4 +46,14 @@ func (handler *shortenHandler) Handler(c httprouter.Context) {
 	c.JSON(http.StatusOK, map[string]string{
 		"short_url": fmt.Sprintf("http://localhost:8080/%s", shortenKey),
 	})
+}
+
+func ShortenKey() string {
+	const size = 6
+	var key [size]byte
+	for i := range size {
+		key[i] = charset[rand.Intn(len(charset))]
+	}
+
+	return string(key[:])
 }
